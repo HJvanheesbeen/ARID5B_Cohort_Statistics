@@ -1,15 +1,15 @@
 # ============================================================
 #  Total Social Time (Summed Across Experiments)
 #  Comparison Between WT and Arid5bQ522* Mice
-#  Two-tailed t-test with outlier detection
+#  Two-tailed t-test with Grubbs outlier detection
 # ============================================================
-
 
 library(dplyr)
 library(ggplot2)
+library(outliers)  # Make sure this is installed
 
 # --- 1. Load data ---
-data_file <- "**Path**/TotalSocialTime.csv"
+data_file <- "***Path***/NumericalData/TotalSocialTime.csv"
 data_raw <- read.csv(data_file, stringsAsFactors = FALSE)
 
 # --- 2. Rename for clarity ---
@@ -26,32 +26,64 @@ data <- data_raw %>%
 data <- data %>%
   mutate(Total_social_time = Exp1 + Familiar_Ex2 + Novel_Ex2)
 
-# --- 4. Identify and remove outliers (1.5x IQR rule per genotype) ---
-detect_outliers <- function(x) {
-  q1 <- quantile(x, 0.25, na.rm = TRUE)
-  q3 <- quantile(x, 0.75, na.rm = TRUE)
-  iqr <- q3 - q1
-  lower <- q1 - 1.5 * iqr
-  upper <- q3 + 1.5 * iqr
-  (x < lower) | (x > upper)
+# --- 4. Identify and remove outliers per genotype using Grubbs' test ---
+remove_grubbs_outliers <- function(x, alpha = 0.05) {
+  x_clean <- x
+  outlier_vals <- c()
+  
+  repeat {
+    if(length(x_clean) < 3) break  # Grubbs requires >=3 values
+    grubbs_test <- try(grubbs.test(x_clean, two.sided = TRUE), silent = TRUE)
+    if(inherits(grubbs_test, "try-error")) break  # no more outliers
+    p_val <- grubbs_test$p.value
+    if(p_val < alpha) {
+      # extract outlier value from test result
+      outlier_val <- as.numeric(strsplit(grubbs_test$alternative, " ")[[1]][3])
+      x_clean <- x_clean[x_clean != outlier_val]
+      outlier_vals <- c(outlier_vals, outlier_val)
+    } else {
+      break
+    }
+  }
+  
+  list(clean = x_clean, outliers = outlier_vals)
 }
 
-data <- data %>%
-  group_by(Genotype) %>%
-  mutate(is_outlier = detect_outliers(Total_social_time)) %>%
-  ungroup()
+# --- 5. Apply Grubbs per genotype ---
+cleaned_data <- data.frame()
+outlier_data <- data.frame()
 
-outliers <- data %>% filter(is_outlier)
-data_clean <- data %>% filter(!is_outlier)
+for(gt in levels(data$Genotype)) {
+  subset_gt <- data$Total_social_time[data$Genotype == gt]
+  res <- remove_grubbs_outliers(subset_gt)
+  
+  # Append cleaned data
+  cleaned_data <- rbind(cleaned_data,
+                        data.frame(Genotype = gt, Total_social_time = res$clean))
+  
+  # Append outliers
+  if(length(res$outliers) > 0) {
+    outlier_data <- rbind(outlier_data,
+                          data.frame(Genotype = gt, Total_social_time = res$outliers))
+  }
+  
+  # Print summary for this genotype
+  cat(sprintf("Genotype '%s': %d outliers removed: %s\n",
+              gt,
+              length(res$outliers),
+              if(length(res$outliers) > 0) paste(round(res$outliers, 2), collapse = ", ") else "None"))
+}
 
-# --- 5. Perform two-tailed independent t-test ---
-ttest_result <- t.test(Total_social_time ~ Genotype, data = data_clean, var.equal = FALSE)
 
-# --- 6. Extract results ---
+# --- 6. Perform two-tailed independent t-test on cleaned data ---
+ttest_result <- t.test(Total_social_time ~ Genotype, data = cleaned_data, var.equal = FALSE)
+
+# --- 7. Extract results ---
 df <- ttest_result$parameter
 t_value <- ttest_result$statistic
 p_value <- ttest_result$p.value
-means <- data_clean %>%
+
+means <- cleaned_data %>%
   group_by(Genotype) %>%
   summarise(
     mean = mean(Total_social_time),
@@ -59,7 +91,8 @@ means <- data_clean %>%
     n = n()
   )
 
-# --- 7. Save text summary---
+# --- 8. Save text summary ---
+output_file <- dirname(data_file)  # Save in same folder as input
 output_text <- sprintf(
   "Two-sample (two-tailed) t-test comparing total social interaction time between genotypes (WT vs Arid5bQ522*):\n
 WT (mean ± SD, n) = %.2f ± %.2f (n = %d)
@@ -72,21 +105,20 @@ Outlier values (if any): %s
   means$mean[1], means$sd[1], means$n[1],
   means$mean[2], means$sd[2], means$n[2],
   df, t_value, p_value,
-  nrow(outliers),
-  ifelse(nrow(outliers) > 0,
-         paste(round(outliers$Total_social_time, 2), collapse = ", "),
+  nrow(outlier_data),
+  ifelse(nrow(outlier_data) > 0,
+         paste(round(outlier_data$Total_social_time, 2), collapse = ", "),
          "None")
 )
 
-output_file <- "**Path**/TotalSocialTime_ttest_summary_outliers.txt"
-writeLines(output_text, output_file)
+summary_file <- file.path(output_file, "TotalSocialTime_ttest_summary_grubbs.txt")
+writeLines(output_text, summary_file)
+cat("Statistical summary saved to:\n", summary_file, "\n")
 
-cat("✅ Statistical summary saved to:\n", output_file, "\n")
+# --- 9. Plot and save SVG ---
+plot_file <- file.path(output_file, "TotalSocialTime_boxplot_grubbs_removed.svg")
 
-# --- 8. Plot and save SVG ---
-plot_file <- "**Path**/TotalSocialTime_boxplot_outliers_removed.svg"
-
-p <- ggplot(data_clean, aes(x = Genotype, y = Total_social_time, fill = Genotype)) +
+p <- ggplot(cleaned_data, aes(x = Genotype, y = Total_social_time, fill = Genotype)) +
   geom_boxplot(alpha = 0.6, outlier.shape = NA, width = 0.6) +
   geom_jitter(width = 0.15, alpha = 0.8, size = 2) +
   theme_minimal(base_size = 14) +
@@ -104,5 +136,4 @@ p <- ggplot(data_clean, aes(x = Genotype, y = Total_social_time, fill = Genotype
   )
 
 ggsave(plot_file, plot = p, width = 5, height = 5, device = "svg")
-
-cat("✅ SVG plot saved to:\n", plot_file, "\n")
+cat("SVG plot saved to:\n", plot_file, "\n")
